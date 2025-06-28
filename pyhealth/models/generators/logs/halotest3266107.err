@@ -1,0 +1,21 @@
+Traceback (most recent call last):
+  File "/u/ethanmr3/halo/PyHealth/pyhealth/models/generators/testing_halo.py", line 5, in <module>
+    from pyhealth.datasets import SampleEHRDataset, get_dataloader
+  File "/u/ethanmr3/.local/lib/python3.9/site-packages/pyhealth/datasets/__init__.py", line 1, in <module>
+    from .base_ehr_dataset import BaseEHRDataset
+  File "/u/ethanmr3/.local/lib/python3.9/site-packages/pyhealth/datasets/base_ehr_dataset.py", line 9, in <module>
+    import pandas as pd
+  File "/u/ethanmr3/.local/lib/python3.9/site-packages/pandas/__init__.py", line 22, in <module>
+    from pandas.compat import is_numpy_dev as _is_numpy_dev  # pyright: ignore # noqa:F401
+  File "/u/ethanmr3/.local/lib/python3.9/site-packages/pandas/compat/__init__.py", line 18, in <module>
+    from pandas.compat.numpy import (
+  File "/u/ethanmr3/.local/lib/python3.9/site-packages/pandas/compat/numpy/__init__.py", line 4, in <module>
+    from pandas.util.version import Version
+  File "/u/ethanmr3/.local/lib/python3.9/site-packages/pandas/util/__init__.py", line 2, in <module>
+    from pandas.util._decorators import (  # noqa:F401
+  File "/u/ethanmr3/.local/lib/python3.9/site-packages/pandas/util/_decorators.py", line 14, in <module>
+    from pandas._libs.properties import cache_readonly
+  File "/u/ethanmr3/.local/lib/python3.9/site-packages/pandas/_libs/__init__.py", line 13, in <module>
+    from pandas._libs.interval import Interval
+  File "pandas/_libs/interval.pyx", line 1, in init pandas._libs.interval
+ValueError: numpy.dtype size changed, may indicate binary incompatibility. Expected 96 from C header, got 88 from PyObject

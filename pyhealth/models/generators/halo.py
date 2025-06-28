@@ -93,3 +93,42 @@ class HaloGenerator(BaseModel):
         )
 
         return {"loss": loss, "y_prob": code_probs, "y_true": target}
+
+    def generate(self,
+                 visits_batch: List[List[int]],
+                 labels_batch: List[np.ndarray],
+                 max_steps: int = None,
+                 random: bool = True) -> List[List[List[int]]]:
+        """
+        Autoregressive generation of synthetic visits.
+
+        Args:
+            visits_batch: prefix visits to condition on.
+            labels_batch: patient label vectors.
+            max_steps: maximum additional visits to generate (default n_ctx-2).
+            random: whether to sample (True) or take argmax (False).
+
+        Returns:
+            List of generated sequences, shape (B, generated_visits...)
+        """
+        # Prepare input tensor with empty slots
+        batch_ehr, _ = self.prepare_batch(visits_batch, labels_batch)
+        B, n_ctx, V = batch_ehr.shape
+        x = torch.tensor(batch_ehr, device=self.device)
+        with torch.no_grad():
+            # use core sample loop; returns full sequence tensor
+            gen = self.model.sample(x, random=random)  # (B, T, V)
+            # convert one-hot back to code indices per visit
+            results = []
+            for b in range(B):
+                visits_out = []
+                arr = gen[b].cpu().numpy()
+                for t in range(2, arr.shape[0]):
+                    # skip padding
+                    if arr[t, C + L + 2] == 1:
+                        break
+                    # extract codes
+                    idxs = np.nonzero(arr[t, :C])[0].tolist()
+                    visits_out.append(idxs)
+                results.append(visits_out)
+        return results
