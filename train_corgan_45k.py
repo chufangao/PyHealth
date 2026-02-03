@@ -2,17 +2,18 @@
 """
 Train CorGAN on 45k MIMIC-III train split with 1k holdout.
 
-Uses V2 hyperparameters:
-- batch_size=128
-- lr=0.0002
-- frozen decoder during GAN phase
-- ae_epochs=50
+Uses V3 hyperparameters (matching original cor-gan):
+- batch_size=512 (original default)
+- lr=0.001 (original default)
+- UNFROZEN decoder during GAN phase (joint training at lr=1e-4)
+- ae_epochs=1 (minimal pretraining)
 - gan_epochs=500
+- Dynamic discriminator schedule (100 iters for first 25 gens + every 500)
 """
 
 import os
 import sys
-sys.path.insert(0, '/u/jalenj4/PyHealth')
+sys.path.insert(0, '/u/jalenj4/PyHealth-Medgan-Corgan-Port')
 import argparse
 import numpy as np
 import pandas as pd
@@ -23,7 +24,7 @@ from tqdm import tqdm
 from collections import defaultdict
 
 from pyhealth.models.generators.corgan import (
-    CorGANAutoencoder, CorGANGenerator, CorGANDiscriminator,
+    CorGANAutoencoder, CorGAN8LayerAutoencoder, CorGANGenerator, CorGANDiscriminator,
     CorGANDataset, weights_init
 )
 
@@ -48,7 +49,15 @@ def load_mimic3_data(data_path):
         for code in codes:
             binary_matrix[i, code_to_idx[code]] = 1
 
+    # Pad to 1,071 codes for synthEHRella architecture compatibility
+    target_n_codes = 1071
+    if len(all_codes) < target_n_codes:
+        padding = np.zeros((len(patient_codes), target_n_codes - len(all_codes)))
+        binary_matrix = np.hstack([binary_matrix, padding])
+        print(f"Padded from {len(all_codes)} to {target_n_codes} codes for architecture compatibility")
+
     print(f"Loaded {len(patient_codes)} patients with {len(all_codes)} unique ICD-9 codes")
+    print(f"Final matrix shape: {binary_matrix.shape}")
     print(f"Data sparsity: {(binary_matrix == 0).mean():.4f}")
     print(f"Avg codes per patient: {binary_matrix.sum(axis=1).mean():.2f}")
 
@@ -93,8 +102,36 @@ def evaluate_generation_quality(autoencoder, generator, n_codes, device, latent_
 def train_corgan(binary_matrix, n_codes, device, args):
     """Train CorGAN model with V2 hyperparameters."""
 
-    # Initialize models
-    autoencoder = CorGANAutoencoder(n_codes).to(device)
+    # Determine architecture based on vocabulary size and user choice
+    if n_codes == 1071:
+        # Option B: Standard 6-layer CNN (no adaptive pooling)
+        autoencoder = CorGANAutoencoder(
+            feature_size=n_codes,
+            latent_dim=args.latent_dim,
+            use_adaptive_pooling=False
+        ).to(device)
+        print(f"✓ Using standard 6-layer CNN for {n_codes} codes (matches original CorGAN)")
+
+    elif n_codes == 6955:
+        # Option C: User chooses architecture
+        if args.architecture == "adaptive":
+            autoencoder = CorGANAutoencoder(
+                feature_size=n_codes,
+                latent_dim=args.latent_dim,
+                use_adaptive_pooling=True
+            ).to(device)
+            print(f"⚠️  Using 6-layer CNN + adaptive pooling for {n_codes} codes")
+
+        elif args.architecture == "8layer":
+            autoencoder = CorGAN8LayerAutoencoder(
+                feature_size=n_codes,
+                latent_dim=args.latent_dim
+            ).to(device)
+            print(f"⚠️  Using 8-layer CNN for {n_codes} codes (experimental architecture)")
+
+    else:
+        raise ValueError(f"Unsupported vocabulary size: {n_codes}. Only 1071 or 6955 supported.")
+
     generator = CorGANGenerator(args.latent_dim, hidden_dim=128).to(device)
     discriminator = CorGANDiscriminator(input_dim=n_codes, hidden_dim=256).to(device)
 
@@ -143,13 +180,17 @@ def train_corgan(binary_matrix, n_codes, device, args):
 
     # Train GAN
     print(f"\nTraining GAN for {args.gan_epochs} epochs...")
-    print("Decoder training: FROZEN (V2 configuration)")
+    print("Decoder training: UNFROZEN (V3 - matching original cor-gan)")
 
+    # V3 FIX #1: Unfreeze decoder and train jointly with generator
+    g_params = [
+        {'params': generator.parameters()},
+        {'params': autoencoder.decoder.parameters(), 'lr': 1e-4}
+    ]
     g_optimizer = torch.optim.Adam(
-        generator.parameters(),
+        g_params,
         lr=args.lr,
-        betas=(args.b1, args.b2),
-        weight_decay=args.weight_decay
+        betas=(args.b1, args.b2)
     )
     d_optimizer = torch.optim.Adam(
         discriminator.parameters(),
@@ -158,9 +199,9 @@ def train_corgan(binary_matrix, n_codes, device, args):
         weight_decay=args.weight_decay
     )
 
-    # Set decoder to eval (frozen)
+    # Freeze encoder, unfreeze decoder
     autoencoder.encoder.eval()
-    autoencoder.decoder.eval()
+    autoencoder.decoder.train()
 
     g_losses = []
     d_losses = []
@@ -175,6 +216,8 @@ def train_corgan(binary_matrix, n_codes, device, args):
     latent_collapse_count = 0
     prev_codes_error = float('inf')
 
+    gen_iteration = 0  # Track total generator iterations for dynamic schedule
+
     for epoch in range(args.gan_epochs):
         g_loss_total = d_loss_total = 0
 
@@ -182,8 +225,16 @@ def train_corgan(binary_matrix, n_codes, device, args):
             batch = batch.to(device)
             batch_size = batch.shape[0]
 
+            # V3 FIX #2: Dynamic discriminator iteration schedule
+            if gen_iteration < 25 or gen_iteration % 500 == 0:
+                n_iter_D = 100
+                if gen_iteration % 25 == 0:  # Log only occasionally
+                    print(f"\n  Gen {gen_iteration}: Using n_iter_D={n_iter_D} (stabilization)")
+            else:
+                n_iter_D = args.n_iter_D
+
             # Train discriminator
-            for _ in range(args.n_iter_D):
+            for _ in range(n_iter_D):
                 d_optimizer.zero_grad()
 
                 real_pred = discriminator(batch)
@@ -207,9 +258,9 @@ def train_corgan(binary_matrix, n_codes, device, args):
                 d_loss.backward()
                 d_optimizer.step()
 
-                # Weight clipping (WGAN)
+                # Weight clipping (WGAN) - use configurable bounds
                 for p in discriminator.parameters():
-                    p.data.clamp_(-0.01, 0.01)
+                    p.data.clamp_(args.clamp_lower, args.clamp_upper)
 
             # Train generator
             g_optimizer.zero_grad()
@@ -232,6 +283,8 @@ def train_corgan(binary_matrix, n_codes, device, args):
 
             g_loss_total += g_loss.item()
             d_loss_total += d_loss.item()
+
+            gen_iteration += 1  # Increment generator iteration counter
 
         avg_g_loss = g_loss_total / len(dataloader)
         avg_d_loss = d_loss_total / len(dataloader)
@@ -324,17 +377,23 @@ def train_corgan(binary_matrix, n_codes, device, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Train CorGAN on 45k train split")
-    parser.add_argument("--train_path", default="/u/jalenj4/pehr_scratch/data_files_train", help="Path to train data")
-    parser.add_argument("--output_path", default="/scratch/jalenj4/corgan_45k_results", help="Output directory")
-    parser.add_argument("--ae_epochs", type=int, default=50, help="Autoencoder pretraining epochs")
+    parser.add_argument("--data_dir", "--train_path", dest="train_path", default="/u/jalenj4/pehr_scratch/data_files_train_3digit", help="Path to train data")
+    parser.add_argument("--output_dir", "--output_path", dest="output_path", default="/scratch/jalenj4/corgan_45k_results", help="Output directory")
+    # V3 FIX #3: Update default hyperparameters to match original cor-gan
+    parser.add_argument("--ae_epochs", type=int, default=1, help="Autoencoder pretraining epochs (V3: 1, original default)")
     parser.add_argument("--gan_epochs", type=int, default=500, help="GAN training epochs")
     parser.add_argument("--latent_dim", type=int, default=128, help="Generator latent dimension")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size (V2 value)")
-    parser.add_argument("--lr", type=float, default=0.0002, help="Learning rate (V2 value)")
-    parser.add_argument("--b1", type=float, default=0.9, help="Adam beta1")
-    parser.add_argument("--b2", type=float, default=0.999, help="Adam beta2")
-    parser.add_argument("--weight_decay", type=float, default=0.0001, help="Weight decay")
-    parser.add_argument("--n_iter_D", type=int, default=5, help="Discriminator iterations per generator")
+    parser.add_argument("--batch_size", type=int, default=512, help="Batch size (V3: 512, original default)")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate (V3: 0.001, original default)")
+    parser.add_argument("--b1", type=float, default=0.5, help="Adam beta1 (V3: 0.5, original default)")
+    parser.add_argument("--b2", type=float, default=0.9, help="Adam beta2 (V3: 0.9, original default)")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay (V3: 0.0, original default)")
+    parser.add_argument("--n_iter_D", type=int, default=5, help="Discriminator iterations per generator (baseline, dynamic schedule overrides)")
+    parser.add_argument("--clamp_lower", type=float, default=-0.01, help="WGAN weight clamp lower bound")
+    parser.add_argument("--clamp_upper", type=float, default=0.01, help="WGAN weight clamp upper bound")
+    parser.add_argument("--architecture", type=str, default="adaptive",
+                        choices=["adaptive", "8layer"],
+                        help="Architecture for 6955 codes: 'adaptive' (6-layer+pool) or '8layer' (8-layer CNN)")
     args = parser.parse_args()
 
     os.makedirs(args.output_path, exist_ok=True)

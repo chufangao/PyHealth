@@ -5,11 +5,13 @@ Uses Variable top-K sampling to maintain natural variation in code counts.
 """
 
 import os
+import sys
+sys.path.insert(0, '/u/jalenj4/PyHealth-Medgan-Corgan-Port')
 import argparse
 import torch
 import numpy as np
 import pandas as pd
-from pyhealth.models.generators.corgan import CorGANAutoencoder, CorGANGenerator, CorGANDiscriminator
+from pyhealth.models.generators.corgan import CorGANAutoencoder, CorGAN8LayerAutoencoder, CorGANGenerator, CorGANDiscriminator
 
 
 def main():
@@ -43,9 +45,31 @@ def main():
     print(f"\nLoading checkpoint from {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-    # Initialize CorGAN components with same architecture
+    # Detect architecture from checkpoint
+    # Check if this is 8-layer by looking at state dict keys
+    state_keys = checkpoint['autoencoder_state_dict'].keys()
+    is_8layer = any('encoder.18' in k or 'encoder.21' in k for k in state_keys)  # 8-layer has more layers
+
+    # Initialize CorGAN components with correct architecture
     print("Initializing CorGAN model components...")
-    autoencoder = CorGANAutoencoder(n_codes).to(device)
+    if n_codes == 6955:
+        if is_8layer:
+            autoencoder = CorGAN8LayerAutoencoder(feature_size=n_codes).to(device)
+            print("Detected 8-layer architecture")
+        else:
+            # Assume adaptive pooling
+            autoencoder = CorGANAutoencoder(
+                feature_size=n_codes,
+                use_adaptive_pooling=True
+            ).to(device)
+            print("Detected 6-layer + adaptive pooling architecture")
+    else:
+        autoencoder = CorGANAutoencoder(
+            feature_size=n_codes,
+            use_adaptive_pooling=False
+        ).to(device)
+        print(f"Using standard 6-layer architecture for {n_codes} codes")
+
     generator = CorGANGenerator(latent_dim=128, hidden_dim=128).to(device)
     discriminator = CorGANDiscriminator(input_dim=n_codes, hidden_dim=256).to(device)
 

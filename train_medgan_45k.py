@@ -7,7 +7,7 @@ Uses standard MedGAN hyperparameters from synthEHRella.
 
 import os
 import sys
-sys.path.insert(0, '/u/jalenj4/PyHealth')
+# sys.path.insert(0, '/u/jalenj4/PyHealth')  # Removed - use local PyHealth-Medgan-Corgan-Port
 import argparse
 import numpy as np
 import pandas as pd
@@ -19,31 +19,61 @@ from collections import defaultdict
 from pyhealth.models.generators.medgan import MedGAN
 
 
-def load_mimic3_data(data_path):
-    """Load MIMIC-III diagnosis data from train split."""
+def load_mimic3_data(data_path, data_mode="binary"):
+    """Load MIMIC-III diagnosis data from train split.
+
+    Args:
+        data_path: Path to MIMIC-III data
+        data_mode: "binary" or "count" - determines how to aggregate codes
+
+    Returns:
+        matrix: Binary or count matrix depending on data_mode
+        all_codes: List of unique ICD-9 codes
+    """
     print(f"Loading MIMIC-III data from: {data_path}")
+    print(f"Data mode: {data_mode}")
 
     diagnoses_df = pd.read_csv(os.path.join(data_path, "DIAGNOSES_ICD.csv"))
     diagnoses_df = diagnoses_df.dropna(subset=['ICD9_CODE'])
     diagnoses_df['ICD9_CODE'] = diagnoses_df['ICD9_CODE'].astype(str)
 
-    patient_codes = defaultdict(set)
-    for _, row in diagnoses_df.iterrows():
-        patient_codes[row['SUBJECT_ID']].add(row['ICD9_CODE'])
+    # Use list for count mode, set for binary mode
+    if data_mode == "binary":
+        patient_codes = defaultdict(set)
+        for _, row in diagnoses_df.iterrows():
+            patient_codes[row['SUBJECT_ID']].add(row['ICD9_CODE'])
+        all_codes = sorted(set().union(*patient_codes.values()))
+    else:  # count mode
+        patient_codes = defaultdict(list)
+        for _, row in diagnoses_df.iterrows():
+            patient_codes[row['SUBJECT_ID']].append(row['ICD9_CODE'])
+        # Get all unique codes across all patients
+        all_codes_set = set()
+        for codes_list in patient_codes.values():
+            all_codes_set.update(codes_list)
+        all_codes = sorted(all_codes_set)
 
-    all_codes = sorted(set().union(*patient_codes.values()))
     code_to_idx = {code: idx for idx, code in enumerate(all_codes)}
 
-    binary_matrix = np.zeros((len(patient_codes), len(all_codes)))
+    # Create matrix based on mode
+    matrix = np.zeros((len(patient_codes), len(all_codes)))
     for i, (patient_id, codes) in enumerate(sorted(patient_codes.items())):
-        for code in codes:
-            binary_matrix[i, code_to_idx[code]] = 1
+        if data_mode == "binary":
+            for code in codes:
+                matrix[i, code_to_idx[code]] = 1
+        else:  # count mode
+            for code in codes:
+                matrix[i, code_to_idx[code]] += 1
 
     print(f"Loaded {len(patient_codes)} patients with {len(all_codes)} unique ICD-9 codes")
-    print(f"Data sparsity: {(binary_matrix == 0).mean():.4f}")
-    print(f"Avg codes per patient: {binary_matrix.sum(axis=1).mean():.2f}")
+    print(f"Data sparsity: {(matrix == 0).mean():.4f}")
+    if data_mode == "binary":
+        print(f"Avg codes per patient: {matrix.sum(axis=1).mean():.2f}")
+    else:
+        print(f"Avg code occurrences per patient: {matrix.sum(axis=1).mean():.2f}")
+        print(f"Max count: {matrix.max():.0f}")
 
-    return binary_matrix, all_codes
+    return matrix, all_codes
 
 
 def train_medgan(model, dataloader, n_epochs, device, save_dir, lr=0.001, weight_decay=0.0001, b1=0.5, b2=0.9):
@@ -154,6 +184,15 @@ def main():
     parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="Weight decay")
+
+    # Count mode parameters
+    parser.add_argument("--data_mode", type=str, default="binary", choices=["binary", "count"],
+                       help="Data mode: 'binary' (default) or 'count'")
+    parser.add_argument("--count_activation", type=str, default="relu", choices=["relu", "softplus"],
+                       help="Activation for count mode: 'relu' (default) or 'softplus'")
+    parser.add_argument("--count_loss", type=str, default="mse", choices=["mse", "poisson"],
+                       help="Loss function for count mode: 'mse' (default) or 'poisson'")
+
     args = parser.parse_args()
 
     os.makedirs(args.output_path, exist_ok=True)
@@ -161,36 +200,60 @@ def main():
     print(f"Using device: {device}")
     print(f"Training on: {args.train_path}")
     print(f"Output to: {args.output_path}")
+    print(f"Data mode: {args.data_mode}")
+    if args.data_mode == "count":
+        print(f"Count activation: {args.count_activation}")
+        print(f"Count loss: {args.count_loss}")
 
     # Load train data
-    binary_matrix, code_vocab = load_mimic3_data(args.train_path)
-    n_patients, n_codes = binary_matrix.shape
+    data_matrix, code_vocab = load_mimic3_data(args.train_path, data_mode=args.data_mode)
+    n_patients, n_codes = data_matrix.shape
 
     # Create dataset
-    tensor_data = torch.FloatTensor(binary_matrix)
+    tensor_data = torch.FloatTensor(data_matrix)
     dataset = TensorDataset(tensor_data)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
-    # Initialize MedGAN from binary matrix
-    print(f"\nInitializing MedGAN (latent_dim={args.latent_dim})...")
-    model = MedGAN.from_binary_matrix(
-        binary_matrix=binary_matrix,
-        latent_dim=args.latent_dim,
-        autoencoder_hidden_dim=128,
-        discriminator_hidden_dim=256,
-        minibatch_averaging=True
-    ).to(device)
+    # Initialize MedGAN
+    print(f"\nInitializing MedGAN (latent_dim={args.latent_dim}, data_mode={args.data_mode})...")
+    if args.data_mode == "binary":
+        model = MedGAN.from_binary_matrix(
+            binary_matrix=data_matrix,
+            latent_dim=args.latent_dim,
+            autoencoder_hidden_dim=128,
+            discriminator_hidden_dim=256,
+            minibatch_averaging=True,
+            data_mode=args.data_mode
+        ).to(device)
+    else:  # count mode
+        model = MedGAN.from_count_matrix(
+            count_matrix=data_matrix,
+            latent_dim=args.latent_dim,
+            autoencoder_hidden_dim=128,
+            discriminator_hidden_dim=256,
+            minibatch_averaging=True,
+            count_activation=args.count_activation,
+            count_loss=args.count_loss
+        ).to(device)
 
     # Pretrain autoencoder
     print(f"\nPretraining autoencoder for {args.ae_epochs} epochs...")
     ae_optimizer = torch.optim.Adam(model.autoencoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Select loss function based on data mode
+    if args.data_mode == "binary":
+        ae_loss_fn = torch.nn.BCELoss()
+    elif args.count_loss == "mse":
+        ae_loss_fn = torch.nn.MSELoss()
+    else:  # poisson
+        ae_loss_fn = torch.nn.PoissonNLLLoss(log_input=False)
 
     for epoch in range(args.ae_epochs):
         total_loss = 0
         for batch_tuple in dataloader:
             batch = batch_tuple[0].to(device)
             reconstructed = model.autoencoder(batch)
-            loss = torch.nn.functional.binary_cross_entropy(reconstructed, batch)
+            loss = ae_loss_fn(reconstructed, batch)
 
             ae_optimizer.zero_grad()
             loss.backward()
@@ -224,10 +287,11 @@ def main():
             f.write(f"{code}\n")
     print(f"Saved vocabulary to: {vocab_path}")
 
-    # Save binary matrix
-    matrix_path = os.path.join(args.output_path, "icd9_binary_matrix.npy")
-    np.save(matrix_path, binary_matrix)
-    print(f"Saved binary matrix to: {matrix_path}")
+    # Save data matrix
+    matrix_filename = f"icd9_{args.data_mode}_matrix.npy"
+    matrix_path = os.path.join(args.output_path, matrix_filename)
+    np.save(matrix_path, data_matrix)
+    print(f"Saved {args.data_mode} matrix to: {matrix_path}")
 
     print("\n✓ Training complete!")
 

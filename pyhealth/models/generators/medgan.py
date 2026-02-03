@@ -10,17 +10,28 @@ from pyhealth.models import BaseModel
 
 class MedGANAutoencoder(nn.Module):
     """simple autoencoder for pretraining"""
-    
-    def __init__(self, input_dim: int, hidden_dim: int = 128):
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128,
+                 data_mode: str = "binary", count_activation: str = "relu"):
         super().__init__()
+        self.data_mode = data_mode
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.Tanh()
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, input_dim),
-            nn.Sigmoid()
-        )
+
+        # Conditional decoder activation based on data mode
+        if data_mode == "binary":
+            self.decoder = nn.Sequential(
+                nn.Linear(hidden_dim, input_dim),
+                nn.Sigmoid()
+            )
+        else:  # count mode
+            activation = nn.ReLU() if count_activation == "relu" else nn.Softplus()
+            self.decoder = nn.Sequential(
+                nn.Linear(hidden_dim, input_dim),
+                activation
+            )
     
     def forward(self, x):
         encoded = self.encoder(x)
@@ -95,6 +106,9 @@ class MedGAN(BaseModel):
         feature_keys: List[str],
         label_key: str,
         mode: str = "generation",
+        data_mode: str = "binary",
+        count_activation: str = "relu",
+        count_loss: str = "mse",
         latent_dim: int = 128,
         hidden_dim: int = 128,
         autoencoder_hidden_dim: int = 128,
@@ -113,7 +127,10 @@ class MedGAN(BaseModel):
         
         wrapped_dataset = DummyWrapper(dataset, feature_keys, label_key)
         super().__init__(dataset=wrapped_dataset)
-        
+
+        self.data_mode = data_mode
+        self.count_activation = count_activation
+        self.count_loss = count_loss
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.minibatch_averaging = minibatch_averaging
@@ -123,10 +140,15 @@ class MedGAN(BaseModel):
         self.input_dim = len(self.global_vocab)
         
         # init components
-        self.autoencoder = MedGANAutoencoder(input_dim=self.input_dim, hidden_dim=autoencoder_hidden_dim)
+        self.autoencoder = MedGANAutoencoder(
+            input_dim=self.input_dim,
+            hidden_dim=autoencoder_hidden_dim,
+            data_mode=data_mode,
+            count_activation=count_activation
+        )
         self.generator = MedGANGenerator(latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim)
         self.discriminator = MedGANDiscriminator(
-            input_dim=self.input_dim, 
+            input_dim=self.input_dim,
             hidden_dim=discriminator_hidden_dim,
             minibatch_averaging=minibatch_averaging
         )
@@ -142,6 +164,9 @@ class MedGAN(BaseModel):
         autoencoder_hidden_dim: int = 128,
         discriminator_hidden_dim: int = 256,
         minibatch_averaging: bool = True,
+        data_mode: str = "binary",
+        count_activation: str = "relu",
+        count_loss: str = "mse",
         **kwargs
     ):
         """create MedGAN model from binary matrix (ICD-9, etc.)"""
@@ -171,6 +196,9 @@ class MedGAN(BaseModel):
             dataset=dummy_dataset,
             feature_keys=["binary_vector"],
             label_key="binary_vector",
+            data_mode=data_mode,
+            count_activation=count_activation,
+            count_loss=count_loss,
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
             autoencoder_hidden_dim=autoencoder_hidden_dim,
@@ -183,10 +211,15 @@ class MedGAN(BaseModel):
         model.input_dim = binary_matrix.shape[1]
         
         # reinitialize components with correct dimensions
-        model.autoencoder = MedGANAutoencoder(input_dim=model.input_dim, hidden_dim=autoencoder_hidden_dim)
+        model.autoencoder = MedGANAutoencoder(
+            input_dim=model.input_dim,
+            hidden_dim=autoencoder_hidden_dim,
+            data_mode=data_mode,
+            count_activation=count_activation
+        )
         model.generator = MedGANGenerator(latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim)
         model.discriminator = MedGANDiscriminator(
-            input_dim=model.input_dim, 
+            input_dim=model.input_dim,
             hidden_dim=discriminator_hidden_dim,
             minibatch_averaging=minibatch_averaging
         )
@@ -202,9 +235,54 @@ class MedGAN(BaseModel):
             return batch_data["binary_vector"].to(device)
         
         model._extract_features_from_batch = extract_features
-        
+
         return model
-    
+
+    @classmethod
+    def from_count_matrix(
+        cls,
+        count_matrix: np.ndarray,
+        latent_dim: int = 128,
+        hidden_dim: int = 128,
+        autoencoder_hidden_dim: int = 128,
+        discriminator_hidden_dim: int = 256,
+        minibatch_averaging: bool = True,
+        count_activation: str = "relu",
+        count_loss: str = "mse",
+        **kwargs
+    ):
+        """Create MedGAN model from count matrix (integers >= 0)
+
+        This is a convenience method that calls from_binary_matrix with data_mode="count".
+        The name is kept as count_matrix to be explicit about expected input format.
+
+        Args:
+            count_matrix: numpy array with shape (n_patients, n_features) containing counts (integers >= 0)
+            latent_dim: dimension of latent space for generator
+            hidden_dim: hidden dimension for generator
+            autoencoder_hidden_dim: hidden dimension for autoencoder
+            discriminator_hidden_dim: hidden dimension for discriminator
+            minibatch_averaging: whether to use minibatch averaging in discriminator
+            count_activation: activation function for count mode ("relu" or "softplus")
+            count_loss: loss function for count mode ("mse" or "poisson")
+            **kwargs: additional arguments
+
+        Returns:
+            MedGAN model configured for count mode
+        """
+        return cls.from_binary_matrix(
+            binary_matrix=count_matrix,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            autoencoder_hidden_dim=autoencoder_hidden_dim,
+            discriminator_hidden_dim=discriminator_hidden_dim,
+            minibatch_averaging=minibatch_averaging,
+            data_mode="count",
+            count_activation=count_activation,
+            count_loss=count_loss,
+            **kwargs
+        )
+
     def _build_global_vocab(self, dataset, feature_keys: List[str]) -> List[str]:
         """build vocab from dataset (simplified)"""
         vocab = set()
@@ -271,9 +349,16 @@ class MedGAN(BaseModel):
         print("="*50)
         print("Epoch | A_loss | Progress")
         print("="*50)
-        
+
         optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=lr)
-        criterion = nn.BCELoss()
+
+        # Conditional loss function based on data mode
+        if self.data_mode == "binary":
+            criterion = nn.BCELoss()
+        elif self.count_loss == "mse":
+            criterion = nn.MSELoss()
+        else:  # poisson
+            criterion = nn.PoissonNLLLoss(log_input=False)
         
         # Track losses for plotting
         a_losses = []
@@ -329,8 +414,11 @@ class MedGAN(BaseModel):
             return torch.cat(features, dim=1).to(device)
     
     def sample_transform(self, samples: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
-        """convert to binary using threshold"""
-        return (samples > threshold).float()
+        """Convert to discrete values based on data mode"""
+        if self.data_mode == "binary":
+            return (samples > threshold).float()
+        else:  # count mode
+            return torch.clamp(torch.round(samples), min=0)
     
     def train_step(self, batch, optimizer_g, optimizer_d, optimizer_ae=None):
         """single training step"""

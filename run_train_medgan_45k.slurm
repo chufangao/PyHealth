@@ -8,9 +8,9 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=jalen.jiang2@gmail.com
 
-cd /u/jalenj4/PyHealth
+cd /u/jalenj4/PyHealth-Medgan-Corgan-Port
 source /u/jalenj4/pehr_scratch/venv/bin/activate
-export PYTHONPATH=/u/jalenj4/PyHealth:$PYTHONPATH
+export PYTHONPATH=/u/jalenj4/PyHealth-Medgan-Corgan-Port:$PYTHONPATH
 
 echo "Training MedGAN on 45k MIMIC-III train split"
 echo "Train data: /u/jalenj4/pehr_scratch/data_files_train"

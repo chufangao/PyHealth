@@ -43,9 +43,12 @@ class CorGANDataset(Dataset):
 
 class CorGANAutoencoder(nn.Module):
     """Autoencoder for CorGAN - uses 1D convolutions to capture correlations"""
-    
-    def __init__(self, feature_size: int):
+
+    def __init__(self, feature_size: int, latent_dim: int = 128, use_adaptive_pooling: bool = False):
         super(CorGANAutoencoder, self).__init__()
+        self.feature_size = feature_size
+        self.latent_dim = latent_dim
+        self.use_adaptive_pooling = use_adaptive_pooling
         n_channels_base = 4
         
         # calculate the size after convolutions
@@ -85,32 +88,42 @@ class CorGANAutoencoder(nn.Module):
             nn.Tanh(),
         )
 
-        # decoder - reverse of encoder (V2 architecture)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose1d(in_channels=32 * n_channels_base, out_channels=16 * n_channels_base, kernel_size=8, stride=1,
+        # decoder - exact match to synthEHRella (wgancnnmimic.py lines 200-228)
+        # Kernel sizes: [5, 5, 7, 7, 7, 3]
+        # Strides: [1, 4, 4, 3, 2, 2]
+        # Activations: ReLU (not LeakyReLU)
+        # Note: First layer has NO BatchNorm
+        decoder_layers = [
+            nn.ConvTranspose1d(in_channels=32 * n_channels_base, out_channels=16 * n_channels_base, kernel_size=5, stride=1,
                                padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros'),
-            nn.BatchNorm1d(16 * n_channels_base),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose1d(in_channels=16 * n_channels_base, out_channels=8 * n_channels_base, kernel_size=5, stride=3,
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=16 * n_channels_base, out_channels=8 * n_channels_base, kernel_size=5, stride=4,
                                padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros'),
             nn.BatchNorm1d(8 * n_channels_base),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose1d(in_channels=8 * n_channels_base, out_channels=4 * n_channels_base, kernel_size=5, stride=3,
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=8 * n_channels_base, out_channels=4 * n_channels_base, kernel_size=7, stride=4,
                                padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros'),
             nn.BatchNorm1d(4 * n_channels_base),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose1d(in_channels=4 * n_channels_base, out_channels=2 * n_channels_base, kernel_size=5, stride=3,
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=4 * n_channels_base, out_channels=2 * n_channels_base, kernel_size=7, stride=3,
                                padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros'),
             nn.BatchNorm1d(2 * n_channels_base),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose1d(in_channels=2 * n_channels_base, out_channels=n_channels_base, kernel_size=5, stride=2,
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=2 * n_channels_base, out_channels=n_channels_base, kernel_size=7, stride=2,
                                padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros'),
             nn.BatchNorm1d(n_channels_base),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose1d(in_channels=n_channels_base, out_channels=1, kernel_size=5, stride=2,
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=n_channels_base, out_channels=1, kernel_size=3, stride=2,
                                padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros'),
-            nn.Sigmoid(),
-        )
+        ]
+
+        # Add adaptive pooling if enabled (for variable vocabulary sizes)
+        if self.use_adaptive_pooling:
+            decoder_layers.append(nn.AdaptiveAvgPool1d(output_size=feature_size))
+
+        decoder_layers.append(nn.Sigmoid())
+
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x):
         # add channel dimension if needed
@@ -118,7 +131,10 @@ class CorGANAutoencoder(nn.Module):
             x = x.unsqueeze(1)  # (batch, 1, features)
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
-        return torch.squeeze(decoded)
+        # Squeeze only the channel dimension (dim=1), not the batch dimension
+        if decoded.dim() == 3 and decoded.shape[1] == 1:
+            decoded = decoded.squeeze(1)
+        return decoded
 
     def decode(self, x):
         # x shape: (batch, 128) from generator - unsqueeze for CNN decoder
@@ -127,6 +143,132 @@ class CorGANAutoencoder(nn.Module):
         decoded = self.decoder(x)  # (batch, 1, output_len)
         if decoded.dim() == 3 and decoded.shape[1] == 1:
             decoded = decoded.squeeze(1)  # (batch, output_len)
+        return decoded
+
+
+class CorGAN8LayerAutoencoder(nn.Module):
+    """
+    8-Layer CNN Autoencoder for CorGAN - designed for 6,955 codes.
+
+    Extends the original 6-layer architecture to support larger vocabularies
+    without adaptive pooling. The encoder compresses 6,955 codes down to a
+    latent space of size (128, 1), then the decoder reconstructs exactly 6,955.
+
+    This is an experimental architecture designed to test whether native
+    dimension matching (no adaptive pooling) produces better synthetic data
+    quality compared to the 6-layer + adaptive pooling approach.
+
+    Args:
+        feature_size: Must be 6955 (architecture is hardcoded for this size)
+        latent_dim: Latent dimension (default: 128)
+    """
+
+    def __init__(self, feature_size: int = 6955, latent_dim: int = 128):
+        super(CorGAN8LayerAutoencoder, self).__init__()
+        assert feature_size == 6955, "8-layer architecture only supports 6955 codes"
+
+        self.feature_size = feature_size
+        self.latent_dim = latent_dim
+
+        # Encoder: 6955 → 1 (8 layers)
+        self.encoder = nn.Sequential(
+            # Layer 1: 6955 → 3476
+            nn.Conv1d(1, 4, kernel_size=5, stride=2, padding=0),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 2: 3476 → 1736
+            nn.Conv1d(4, 8, kernel_size=5, stride=2, padding=0),
+            nn.BatchNorm1d(8),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 3: 1736 → 578
+            nn.Conv1d(8, 16, kernel_size=5, stride=3, padding=0),
+            nn.BatchNorm1d(16),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 4: 578 → 192
+            nn.Conv1d(16, 32, kernel_size=5, stride=3, padding=0),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 5: 192 → 63
+            nn.Conv1d(32, 64, kernel_size=5, stride=3, padding=0),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 6: 63 → 20 [NEW]
+            nn.Conv1d(64, 96, kernel_size=5, stride=3, padding=0),
+            nn.BatchNorm1d(96),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 7: 20 → 4 [NEW]
+            nn.Conv1d(96, 112, kernel_size=5, stride=4, padding=0),
+            nn.BatchNorm1d(112),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 8: 4 → 1 [NEW]
+            nn.Conv1d(112, 128, kernel_size=4, stride=1, padding=0),
+            nn.Tanh(),
+        )
+
+        # Decoder: 1 → 6955 (8 layers)
+        self.decoder = nn.Sequential(
+            # Layer 1: 1 → 4 (NO BatchNorm on first layer)
+            nn.ConvTranspose1d(128, 112, kernel_size=4, stride=1, padding=0),
+            nn.ReLU(),
+
+            # Layer 2: 4 → 20
+            nn.ConvTranspose1d(112, 96, kernel_size=8, stride=4, padding=0),
+            nn.BatchNorm1d(96),
+            nn.ReLU(),
+
+            # Layer 3: 20 → 63
+            nn.ConvTranspose1d(96, 64, kernel_size=6, stride=3, padding=0),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+
+            # Layer 4: 63 → 192
+            nn.ConvTranspose1d(64, 32, kernel_size=6, stride=3, padding=0),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+
+            # Layer 5: 192 → 578
+            nn.ConvTranspose1d(32, 16, kernel_size=5, stride=3, padding=0),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+
+            # Layer 6: 578 → 1736
+            nn.ConvTranspose1d(16, 8, kernel_size=5, stride=3, padding=0),
+            nn.BatchNorm1d(8),
+            nn.ReLU(),
+
+            # Layer 7: 1736 → 3476
+            nn.ConvTranspose1d(8, 4, kernel_size=6, stride=2, padding=0),
+            nn.BatchNorm1d(4),
+            nn.ReLU(),
+
+            # Layer 8: 3476 → 6955
+            nn.ConvTranspose1d(4, 1, kernel_size=5, stride=2, padding=0),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)  # (batch, 1, features)
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        # Squeeze only channel dimension
+        if decoded.dim() == 3 and decoded.shape[1] == 1:
+            decoded = decoded.squeeze(1)
+        return decoded
+
+    def decode(self, x):
+        """Decode latent representation from generator."""
+        if x.dim() == 2:
+            x = x.unsqueeze(2)  # (batch, 128, 1)
+        decoded = self.decoder(x)
+        if decoded.dim() == 3 and decoded.shape[1] == 1:
+            decoded = decoded.squeeze(1)
         return decoded
 
 
@@ -197,7 +339,11 @@ class CorGANLinearAutoencoder(nn.Module):
 
 
 class CorGANGenerator(nn.Module):
-    """Generator for CorGAN - MLP with residual connections (V2 architecture)"""
+    """
+    Generator for CorGAN - MLP with residual connections
+
+    Architecture matches synthEHRella exactly (wgancnnmimic.py lines 242-263)
+    """
 
     def __init__(self, latent_dim: int = 128, hidden_dim: int = 128):
         super(CorGANGenerator, self).__init__()
@@ -229,52 +375,83 @@ class CorGANGenerator(nn.Module):
 
 
 class CorGANDiscriminator(nn.Module):
-    """Discriminator for CorGAN - MLP with minibatch averaging"""
-    
+    """
+    Discriminator for CorGAN - MLP with minibatch averaging
+
+    Architecture matches synthEHRella exactly (wgancnnmimic.py lines 265-296):
+    - 4 linear layers: input → 256 → 256 → 256 → 1
+    - ReLU activations
+    - No sigmoid (WGAN uses unbounded critic outputs)
+    """
+
     def __init__(self, input_dim: int, hidden_dim: int = 256, minibatch_averaging: bool = True):
         super(CorGANDiscriminator, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.minibatch_averaging = minibatch_averaging
-        
+
         # adjust input dimension for minibatch averaging
-        model_input_dim = input_dim * 2 if minibatch_averaging else input_dim
-        
+        ma_coef = 1
+        if minibatch_averaging:
+            ma_coef = ma_coef * 2
+        model_input_dim = ma_coef * input_dim
+
+        # 4-layer architecture matching synthEHRella exactly
         self.model = nn.Sequential(
-            nn.Linear(model_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(model_input_dim, self.hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(self.hidden_dim, int(self.hidden_dim)),
+            nn.ReLU(True),
+            nn.Linear(self.hidden_dim, int(self.hidden_dim)),
+            nn.ReLU(True),
+            nn.Linear(int(self.hidden_dim), 1)
             # No sigmoid - WGAN uses unbounded critic outputs
         )
-    
+
     def forward(self, x):
         if self.minibatch_averaging:
             # minibatch averaging: concatenate batch mean to each sample
             x_mean = torch.mean(x, dim=0).repeat(x.shape[0], 1)
             x = torch.cat((x, x_mean), dim=1)
-        
+
         output = self.model(x)
         return output
 
 
 def weights_init(m):
-    """Initialize network weights"""
+    """
+    Custom weight initialization (synthEHRella implementation)
+
+    Reference: synthEHRella wgancnnmimic.py lines 363-377
+    """
     classname = m.__class__.__name__
     if classname.find('Conv') != -1:
         nn.init.normal_(m.weight.data, 0.0, 0.02)
     elif classname.find('BatchNorm') != -1:
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
-    elif isinstance(m, nn.Linear):  # Use isinstance to match only actual Linear layers
-        nn.init.normal_(m.weight.data, 0.0, 0.02)
-        nn.init.constant_(m.bias.data, 0)
+    if type(m) == nn.Linear:
+        torch.nn.init.xavier_uniform_(m.weight)
+        m.bias.data.fill_(0.01)
 
 
 def autoencoder_loss(x_output, y_target):
-    """Autoencoder reconstruction loss"""
-    return F.binary_cross_entropy(x_output, y_target, reduction='mean')
+    """
+    Autoencoder reconstruction loss (synthEHRella implementation)
+
+    This implementation is equivalent to torch.nn.BCELoss(reduction='sum') / batch_size
+    As our matrix is too sparse, first we will take a sum over the features and then
+    do the mean over the batch.
+
+    WARNING: This is NOT equivalent to torch.nn.BCELoss(reduction='mean') as the latter
+    means over both features and batches.
+
+    Reference: synthEHRella wgancnnmimic.py lines 312-323
+    """
+    epsilon = 1e-12
+    term = y_target * torch.log(x_output + epsilon) + (1. - y_target) * torch.log(1. - x_output + epsilon)
+    loss = torch.mean(-torch.sum(term, 1), 0)
+    return loss
 
 
 def discriminator_accuracy(predicted, y_true):
@@ -368,7 +545,13 @@ class CorGAN(BaseModel):
         self.tokenizer = Tokenizer(tokens=self.global_vocab, special_tokens=[])
         
         # initialize components
-        self.autoencoder = CorGANAutoencoder(feature_size=self.input_dim)
+        # Determine if adaptive pooling is needed (only for non-standard vocabulary sizes)
+        use_adaptive_pooling = (self.input_dim != 1071)
+        self.autoencoder = CorGANAutoencoder(
+            feature_size=self.input_dim,
+            latent_dim=latent_dim,
+            use_adaptive_pooling=use_adaptive_pooling
+        )
         self.autoencoder_decoder = self.autoencoder.decoder  # separate decoder for generator
         
         self.generator = CorGANGenerator(
@@ -378,7 +561,7 @@ class CorGAN(BaseModel):
         
         self.discriminator = CorGANDiscriminator(
             input_dim=self.input_dim,
-            hidden_dim=hidden_dim * 2,
+            hidden_dim=256,  # Match synthEHRella exactly (not hidden_dim * 2)
             minibatch_averaging=minibatch_averaging
         )
         
